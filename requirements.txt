@@ -1,0 +1,23 @@
+# Captain's Sidestick — Python dependencies
+# Install with:  pip install -r requirements.txt
+#
+# Prerequisites (Windows-only, install manually):
+#   ViGEmBus driver  → https://github.com/nefarius/ViGEmBus/releases
+#   (The Inno Setup installer handles this automatically.)
+
+# ── Virtual controller ──────────────────────────────────────────────────────
+# Requires ViGEmBus kernel driver to be installed first
+vgamepad==0.6.0
+
+# ── WebSocket server ────────────────────────────────────────────────────────
+websockets==13.1
+
+# ── QR code generation ──────────────────────────────────────────────────────
+qrcode[pil]==8.0
+Pillow>=10.4.0
+
+# ── System tray icon ────────────────────────────────────────────────────────
+pystray==0.19.5
+
+# ── PyInstaller (build tooling only — not needed at runtime) ────────────────
+pyinstaller>=6.9.0
