@@ -24,4 +24,4 @@ See [Releases](../../releases) for latest installer
 
 ## Android App
 Download the phone controller here:
-[Captain's Sidestick Android](https://github.com/YOURUSERNAME/captains-sidestick-android)
+[Captain's Sidestick Android](https://github.com/Alizaid121/captains-sidestick-android)
