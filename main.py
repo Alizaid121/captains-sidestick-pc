@@ -2,16 +2,15 @@
 Captain's Sidestick — Pure Python Virtual Joystick Bridge
 ==========================================================
 Receives flight‑sim axis/button data from a phone via WebSocket
-and feeds it into a virtual Xbox 360 controller via ViGEmBus.
+and feeds it into a vJoy virtual joystick via pyvjoystick.
 
 Architecture
 ------------
-  Main thread   : tkinter UI  +  vgamepad writes  +  root.after() tick
-  Thread‑2      : asyncio event loop that runs the WebSocket server
+  Main thread   : tkinter UI  +  root.after() tick (UI only)
+  Thread‑2      : asyncio event loop — WebSocket server + vJoy writes
+                  vJoy.update() is called synchronously on every message,
+                  in the same thread as receipt — zero queue, zero lag.
   Shared state  : _AppState dataclass protected by threading.Lock
-
-All gamepad writes happen inside the tkinter main‑thread tick so we
-never touch vgamepad from two threads simultaneously.
 """
 
 from __future__ import annotations
@@ -30,11 +29,11 @@ from typing import Optional
 
 # ── Third-party (see requirements.txt) ──────────────────────────────────────
 try:
-    import vgamepad as vg
-    VGAMEPAD_OK = True
-except Exception as _vge:
-    VGAMEPAD_OK = False
-    print(f"[WARN] vgamepad unavailable: {_vge}")
+    from pyvjoystick import vjoy as vj
+    VJOY_OK = True
+except Exception as _vje:
+    VJOY_OK = False
+    print(f"[WARN] pyvjoystick unavailable: {_vje}")
 
 try:
     import websockets
@@ -99,6 +98,7 @@ class _AppState:
     server_running:    bool = False
     client_connected:  bool = False
     controller_ready:  bool = False
+    controller_error:  str  = ""   # human-readable vJoy error, empty when OK
 
     # Timestamp of last received packet (for connection watchdog)
     last_rx: float = 0.0
@@ -124,104 +124,164 @@ class _AppState:
                 "thr":     self.thr,
                 "rud":     self.rud,
                 "buttons": dict(self.buttons),
-                "server_running":   self.server_running,
-                "client_connected": self.client_connected,
-                "controller_ready": self.controller_ready,
+                "server_running":    self.server_running,
+                "client_connected":  self.client_connected,
+                "controller_ready":  self.controller_ready,
+                "controller_error":  self.controller_error,
                 "last_rx": self.last_rx,
             }
 
+# ── vJoy error classifier ────────────────────────────────────────────────────
+def get_vjoy_error_message(error_str: str) -> str:
+    """Map a raw vJoy exception string to a specific, actionable UI message."""
+    e = error_str.lower()
+    if "dll" in e or "not found" in e or "module" in e:
+        return "vJoy driver not installed. Download from github.com/jshafer817/vJoy/releases"
+    elif "acquired" in e or "busy" in e:
+        return "vJoy device busy. Open vJoy Monitor and check Device 1 is free"
+    elif "enabled" in e or "disabled" in e:
+        return "vJoy device disabled. Open Configure vJoy and enable Device 1"
+    elif "configured" in e or "axes" in e:
+        return "vJoy not configured. Open Configure vJoy, enable X Y Z Rx axes on Device 1"
+    else:
+        return f"vJoy error: {error_str}. Try restarting the app as Administrator"
+
+
 # ── Virtual controller helper ────────────────────────────────────────────────
 class VirtualController:
-    """Wraps vgamepad.VX360Gamepad and provides safe axis/button writes."""
+    """Wraps pyvjoystick.VJoyDevice(1) and provides safe axis/button writes.
+
+    On acquisition failure the specific error is stored in _AppState so the
+    UI can show it.  A background retry thread attempts re-acquisition every
+    5 seconds — when vJoy becomes available the dot turns green automatically.
+    """
 
     def __init__(self) -> None:
-        self.gamepad: Optional[vg.VX360Gamepad] = None
+        self.joystick: Optional[vj.VJoyDevice] = None
         self.ready = False
-        self._prev_buttons: dict = {}
+        self._state: Optional["_AppState"] = None   # set by start()
 
-    def start(self) -> bool:
-        if not VGAMEPAD_OK:
+    # ── Axis conversion helpers ───────────────────────────────────────────────
+    @staticmethod
+    def _to_vjoy_axis(val: float) -> int:
+        """Convert –1.0…+1.0 float to vJoy range 1…32768 (centre = 16384)."""
+        return int((val + 1.0) * 0.5 * 32767) + 1
+
+    @staticmethod
+    def _to_vjoy_throttle(val: float) -> int:
+        """Convert 0.0…1.0 float to vJoy range 1…32768."""
+        return int(val * 32767) + 1
+
+    def start(self, state: "_AppState") -> bool:
+        """Attempt vJoy acquisition.  On failure, store a helpful message in
+        state and launch a background retry thread."""
+        self._state = state
+        success = self._try_acquire()
+        if not success:
+            # Retry every 5 s in a daemon thread so the UI stays live
+            t = threading.Thread(target=self._retry_loop, name="vjoy-retry", daemon=True)
+            t.start()
+        return success
+
+    def _try_acquire(self) -> bool:
+        """Single acquisition attempt.  Returns True on success."""
+        if not VJOY_OK:
+            msg = get_vjoy_error_message("dll not found")
+            self._set_error(msg)
             return False
         try:
-            self.gamepad = vg.VX360Gamepad()
-            self.gamepad.reset()
-            self.gamepad.update()
+            self.joystick = vj.VJoyDevice(1)
+
+            # ── Wake-up sequence ──────────────────────────────────────────────
+            # vJoy leaves the device uninitialised after acquisition.
+            # Write all axes to neutral and pulse button 1 so X-Plane's
+            # input scanner promotes the device from idle → active.
+            CENTER       = self._to_vjoy_axis(0.0)     # 16384 — true centre
+            THROTTLE_MIN = self._to_vjoy_throttle(0.0)  # 1 — closed
+
+            self.joystick._data.wAxisX    = CENTER
+            self.joystick._data.wAxisY    = CENTER
+            self.joystick._data.wAxisZ    = THROTTLE_MIN
+            self.joystick._data.wAxisXRot = CENTER
+            self.joystick._data.lButtons  = 1    # button 1 pressed (bit 0)
+            self.joystick.update()
+            time.sleep(0.5)
+            self.joystick._data.lButtons  = 0    # button 1 released
+            self.joystick.update()
+
             self.ready = True
-            print("[CTRL] Virtual Xbox 360 controller created.")
+            self._set_ok()
+            print("[CTRL] vJoy device 1 acquired and activated.")
             return True
+
         except Exception as exc:
-            print(f"[CTRL] Failed to create controller: {exc}")
+            self.joystick = None
+            self.ready    = False
+            msg = get_vjoy_error_message(str(exc))
+            self._set_error(msg)
+            print(f"[CTRL] Acquisition failed: {msg}")
             return False
 
-    # ── Axis helpers ─────────────────────────────────────────────────────────
-    @staticmethod
-    def _clamp(v: float, lo: float, hi: float) -> float:
-        return max(lo, min(hi, v))
+    def _retry_loop(self) -> None:
+        """Retry acquisition every 5 seconds until successful."""
+        while not self.ready:
+            time.sleep(5)
+            if self.ready:
+                break
+            print("[CTRL] Retrying vJoy acquisition…")
+            self._try_acquire()
 
-    @staticmethod
-    def _axis_to_short(v: float) -> int:
-        """Convert –1.0…+1.0 float to –32768…32767 int (XInput range)."""
-        return int(VirtualController._clamp(v, -1.0, 1.0) * 32767)
+    # ── State helpers (thread-safe) ───────────────────────────────────────────
+    def _set_ok(self) -> None:
+        if self._state:
+            with self._state._lock:
+                self._state.controller_ready = True
+                self._state.controller_error = ""
 
-    @staticmethod
-    def _trigger_to_byte(v: float) -> int:
-        """Convert 0.0…1.0 float to 0…255 trigger byte."""
-        return int(VirtualController._clamp(v, 0.0, 1.0) * 255)
-
-    # ── Button map ───────────────────────────────────────────────────────────
-    #   (XUSB_BUTTON constants from vgamepad)
-    _BTN_MAP = {
-        "a":        "XUSB_GAMEPAD_A",
-        "b":        "XUSB_GAMEPAD_B",
-        "x":        "XUSB_GAMEPAD_X",
-        "y":        "XUSB_GAMEPAD_Y",
-        "toga":     "XUSB_GAMEPAD_B",      # TOGA → B
-        "idle":     "XUSB_GAMEPAD_X",      # idle → X
-        "reverse":  "XUSB_GAMEPAD_Y",      # reverse → Y
-        "gear":     "XUSB_GAMEPAD_LEFT_SHOULDER",    # LB
-        "flapsUp":  "XUSB_GAMEPAD_RIGHT_SHOULDER",   # RB
-        "ptt":      "XUSB_GAMEPAD_START",
-    }
+    def _set_error(self, msg: str) -> None:
+        if self._state:
+            with self._state._lock:
+                self._state.controller_ready = False
+                self._state.controller_error = msg
 
     def apply(self, snap: dict) -> None:
-        """Write axes and buttons to the virtual controller, then update()."""
-        if not self.ready or self.gamepad is None:
+        """Write axes and buttons to the vJoy device via _data batch, then update()."""
+        if not self.ready or self.joystick is None:
             return
 
         try:
-            # ── Right stick → pitch (Y) + roll (X) ──────────────────────────
-            #   Phone pitch: nose-up positive → invert for Y axis convention
-            self.gamepad.right_joystick(
-                x_value_float= snap["roll"],
-                y_value_float=-snap["pitch"],   # invert: pull back = positive
-            )
-
-            # ── Left stick X → rudder ────────────────────────────────────────
-            self.gamepad.left_joystick(
-                x_value_float=snap["rud"],
-                y_value_float=0.0,
-            )
-
-            # ── Right trigger → throttle ─────────────────────────────────────
-            self.gamepad.right_trigger_float(value_float=snap["thr"])
-
-            # ── flapsDown → left trigger ─────────────────────────────────────
-            lt_val = 1.0 if snap["buttons"].get("flapsDown", False) else 0.0
-            self.gamepad.left_trigger_float(value_float=lt_val)
-
-            # ── All other buttons ─────────────────────────────────────────────
+            # ── Build button bitmask ──────────────────────────────────────────
+            # Each bit corresponds to one button (bit 0 = button 1, etc.).
+            # Using a single lButtons integer avoids the set_button/update
+            # stale-data bug entirely — one _data write, one update() call.
+            _BTN_BITS = {
+                "toga": 0, "idle": 1, "reverse": 2,
+                "gear": 3, "flapsUp": 4, "flapsDown": 5,
+                "ptt": 6, "a": 7, "b": 8, "x": 9, "y": 10,
+            }
             btns = snap["buttons"]
-            for name, xusb_name in self._BTN_MAP.items():
-                if name == "flapsDown":
-                    continue   # handled as trigger above
-                xusb_const = getattr(vg.XUSB_BUTTON, xusb_name)
+            mask = 0
+            for name, bit in _BTN_BITS.items():
                 if btns.get(name, False):
-                    self.gamepad.press_button(button=xusb_const)
-                else:
-                    self.gamepad.release_button(button=xusb_const)
+                    mask |= (1 << bit)
 
-            # ── Commit all changes in one call ────────────────────────────────
-            self.gamepad.update()
+            # ── Write all axes + button mask directly to _data ────────────────
+            # Never call set_axis() — it stages values in a secondary buffer
+            # that update() overwrites with the _data struct, losing the write.
+            # Writing to _data directly means update() sends exactly what we set.
+            #
+            # X  → roll          (–1.0…+1.0)
+            # Y  → pitch inverted (pull-back = positive in sim)
+            # Z  → throttle      (0.0…1.0)
+            # RX → rudder        (–1.0…+1.0)
+            self.joystick._data.wAxisX    = self._to_vjoy_axis(snap["roll"])
+            self.joystick._data.wAxisY    = self._to_vjoy_axis(-snap["pitch"])
+            self.joystick._data.wAxisZ    = self._to_vjoy_throttle(snap["thr"])
+            self.joystick._data.wAxisXRot = self._to_vjoy_axis(snap["rud"])
+            self.joystick._data.lButtons  = mask
+
+            # ── Single update() flushes the complete _data struct to the driver ─
+            self.joystick.update()
 
         except Exception as exc:
             print(f"[CTRL] apply() error: {exc}")
@@ -230,11 +290,15 @@ class VirtualController:
 class WSServer:
     """
     Async WebSocket server.  Runs entirely inside a dedicated thread that
-    owns an asyncio event loop.  Updates _AppState via update_from_json().
+    owns an asyncio event loop.
+
+    vJoy is updated synchronously inside _handler on every received message —
+    same thread, no queue, no timer delay.
     """
 
-    def __init__(self, state: _AppState) -> None:
-        self._state   = state
+    def __init__(self, state: _AppState, controller: "VirtualController") -> None:
+        self._state      = state
+        self._controller = controller
         self._loop:   Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._server  = None   # websockets server object
@@ -284,18 +348,27 @@ class WSServer:
             print(f"[WS] Could not bind port {WS_PORT}: {exc}")
 
     async def _handler(self, ws: "WebSocketServerProtocol") -> None:
-        """Handle one client connection."""
+        """Handle one client connection.
+
+        vJoy is written synchronously on every packet — apply() is called
+        in this thread immediately after parsing, with no intermediate queue
+        or rate limit.  The 100 ms UI tick reads the same _AppState for
+        display only and never touches vJoy.
+        """
         peer = ws.remote_address
         print(f"[WS] Client connected: {peer}")
         with self._state._lock:
             self._state.client_connected = True
-            self._state.last_rx = time.monotonic()  # prevent watchdog false-positive before first packet
+            self._state.last_rx = time.monotonic()
 
         try:
             async for raw in ws:
                 try:
                     data = json.loads(raw)
+                    # 1. Update shared state (used by UI tick for display)
                     self._state.update_from_json(data)
+                    # 2. Write to vJoy immediately — same thread, zero buffering
+                    self._controller.apply(self._state.snapshot())
                 except json.JSONDecodeError:
                     pass   # silently discard malformed packets
 
@@ -404,7 +477,7 @@ class AppUI:
             bg=BG_CARD, fg=AMBER
         ).pack()
         tk.Label(
-            hdr, text="Virtual Joystick Bridge  v1.0",
+            hdr, text="Virtual Joystick Bridge  v2.2.1",
             font=("Consolas", 9),
             bg=BG_CARD, fg=AMBER_DIM
         ).pack()
@@ -458,7 +531,15 @@ class AppUI:
 
         self._dot_server = _status_dot(row, "SERVER")
         self._dot_device = _status_dot(row, "DEVICE")
-        self._dot_ctrl   = _status_dot(row, "CONTROLLER")
+        self._dot_ctrl   = _status_dot(row, "vJoy")
+
+        # Error message shown in red below the dots when vJoy fails
+        self._ctrl_error_lbl = tk.Label(
+            status_frame, text="",
+            font=("Consolas", 8), bg=BG_PANEL, fg=RED,
+            wraplength=480, justify="center",
+        )
+        self._ctrl_error_lbl.pack(pady=(2, 0))
 
         # ── Axis display ─────────────────────────────────────────────────────
         axis_frame = tk.Frame(r, bg=BG_PANEL, pady=8)
@@ -578,23 +659,28 @@ class AppUI:
 
     # ── Main tick — called every UI_TICK_MS milliseconds ─────────────────────
     def _tick(self) -> None:
-        """Read shared state, update gamepad, refresh UI."""
+        """Refresh UI from shared state snapshot.
+
+        vJoy writes happen in the WebSocket thread on every received packet,
+        so _tick is UI-only — no controller writes here.
+        """
         snap = self._state.snapshot()
 
-        # ── 1. Push data to virtual controller (safe: main thread only) ──────
-        self._ctrl.apply(snap)
-
-        # ── 2. Connection watchdog: mark disconnected if >3 s silent ─────────
+        # ── 1. Connection watchdog: mark disconnected if >3 s silent ─────────
         if snap["client_connected"]:
             if time.monotonic() - snap["last_rx"] > 3.0:
                 with self._state._lock:
                     self._state.client_connected = False
                 snap["client_connected"] = False
 
-        # ── 3. Status dots ────────────────────────────────────────────────────
+        # ── 2. Status dots ────────────────────────────────────────────────────
         self._dot_server.config(fg=GREEN if snap["server_running"]   else RED)
         self._dot_device.config(fg=GREEN if snap["client_connected"] else RED)
         self._dot_ctrl.config(  fg=GREEN if snap["controller_ready"] else RED)
+
+        # ── 3. vJoy error message — show when failed, clear when OK ──────────
+        err = snap["controller_error"]
+        self._ctrl_error_lbl.config(text=err)
 
         # ── 4. Axis labels + bars ─────────────────────────────────────────────
         def _fmt(v: float) -> str:
@@ -709,12 +795,10 @@ def main() -> None:
 
     # 2. Virtual controller (create before UI so status shows correctly)
     ctrl = VirtualController()
-    ok = ctrl.start()
-    with state._lock:
-        state.controller_ready = ok
+    ctrl.start(state)   # state is passed so errors and retry can update it
 
-    # 3. WebSocket server (background thread)
-    ws = WSServer(state)
+    # 3. WebSocket server (background thread) — pass controller for direct apply()
+    ws = WSServer(state, ctrl)
     if WEBSOCKETS_OK:
         ws.start_thread()
     else:

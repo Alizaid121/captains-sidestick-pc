@@ -64,7 +64,7 @@ pyinstaller ^
     --onefile ^
     --windowed ^
     --name "CaptainsSidestick" ^
-    --add-data "." ^
+    --add-data ".;." ^
     --hidden-import vgamepad ^
     --hidden-import websockets ^
     --hidden-import qrcode ^

@@ -5,9 +5,10 @@
 #   ViGEmBus driver  → https://github.com/nefarius/ViGEmBus/releases
 #   (The Inno Setup installer handles this automatically.)
 
-# ── Virtual controller ──────────────────────────────────────────────────────
-# Requires ViGEmBus kernel driver to be installed first
-vgamepad==0.6.0
+# ── Virtual joystick ────────────────────────────────────────────────────────
+# Requires vJoy driver to be installed first:
+#   https://github.com/jshafer817/vJoy/releases
+pyvjoystick
 
 # ── WebSocket server ────────────────────────────────────────────────────────
 websockets==13.1
